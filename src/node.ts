@@ -59,3 +59,26 @@ export class Directory extends FsNode {
     return false;
   }
 }
+
+/**
+ * A symbolic link.
+ *
+ * Stores the *literal* target path string at creation time — we don't
+ * pre-resolve it to a node reference. This means:
+ *   - Broken symlinks are allowed (the target can refer to nothing).
+ *   - If the target moves, the link tracks the *path*, not the node — so
+ *     it may become broken or point to a different node than originally.
+ *   - Relative targets are resolved against the symlink's parent
+ *     directory at access time, not against the cwd.
+ *
+ * This matches POSIX symlink semantics.
+ */
+export class Symlink extends FsNode {
+  constructor(
+    name: string,
+    parent: Directory,
+    public target: string,
+  ) {
+    super(name, parent);
+  }
+}

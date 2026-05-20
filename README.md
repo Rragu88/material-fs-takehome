@@ -7,7 +7,7 @@ Security take-home exercise.
 
 ```bash
 npm install
-npm test          # 76 tests across 2 spec files
+npm test          # 90 tests across 2 spec files
 npm run typecheck # strict TypeScript with noUncheckedIndexedAccess
 ```
 
@@ -45,6 +45,11 @@ fs.walk(undefined, (node, path) => {
   /* return "skip" to prune */
 });
 fs.findRegex(/\.log$/);
+
+// Symlinks (extension)
+fs.symlink("/target", "/link"); // create
+fs.readSymlink("/link"); // "/target" — does not follow
+fs.readFile("/link"); // follows the link to read the target
 ```
 
 Paths can be absolute (`/a/b`), relative (`a/b`, `./a`, `../a`), or use `..`
@@ -52,25 +57,26 @@ to traverse to parents. `..` at the root is a no-op (matches POSIX).
 
 ## What's in scope
 
-| Capability                                                                          | Source                          |
-| ----------------------------------------------------------------------------------- | ------------------------------- |
-| `cd`, `pwd`, `mkdir`, `rmdir`, `ls`, `touch`, `readFile`, `writeFile`, `mv`, `find` | Base spec                       |
-| Absolute and relative paths, `..` traversal, `mkdir -p` style intermediate creation | "Operations on paths" extension |
-| `walk(path, visitor)` with prune-via-`"skip"`, plus `findRegex` built on top        | "Walk a subtree" extension      |
+| Capability                                                                          | Source                             |
+| ----------------------------------------------------------------------------------- | ---------------------------------- |
+| `cd`, `pwd`, `mkdir`, `rmdir`, `ls`, `touch`, `readFile`, `writeFile`, `mv`, `find` | Base spec                          |
+| Absolute and relative paths, `..` traversal, `mkdir -p` style intermediate creation | "Operations on paths" extension    |
+| `walk(path, visitor)` with prune-via-`"skip"`, plus `findRegex` built on top        | "Walk a subtree" extension         |
+| `symlink`, `readSymlink`, POSIX-style indirection with loop detection (max 40 hops) | "Symlinks and hardlinks" extension |
 
 ## What's out of scope (and why)
 
-I committed to two extensions deeply rather than touching every extension
+I went deep on three extensions rather than touching every extension
 shallowly. Out of scope:
 
 - **Copy** (`cp`) — the spec lists move _and_ copy together as one
   extension. I implemented `mv` (which the base spec requires anyway)
-  and chose to spend the time on walk/regex find rather than on a
+  and chose to spend the time on walk + symlinks rather than on a
   separate copy primitive.
-- **Symlinks and hardlinks** — would require either path-rewriting at
-  resolution time (symlinks) or reference-counted shared content
-  (hardlinks). Both interact non-trivially with `mv` and `rmdir`. Out of
-  scope to keep the existing semantics tight.
+- **Hardlinks** — would require reference-counted shared content with
+  ownership of the inode-like data passing to the last surviving link.
+  Distinct design problem from symlinks; out of scope to keep the
+  symlink semantics tight.
 - **Permissions and multiple users** — orthogonal to the tree structure.
   Could be layered on top by attaching a `permissions` field to `FsNode`
   and threading a `user` argument through public methods, but the design
@@ -83,12 +89,12 @@ shallowly. Out of scope:
 
 ### Module layout
 
-| File                | Responsibility                                                                            |
-| ------------------- | ----------------------------------------------------------------------------------------- |
-| `src/path.ts`       | Immutable `Path` value object. Parsing, normalization (`.`, `..`), `join`, `resolve`.     |
-| `src/node.ts`       | `FsNode` (abstract), `File`, `Directory`. Passive data — `FileSystem` manages invariants. |
-| `src/filesystem.ts` | The `FileSystem` class. One session, one mutable cwd. All operations live here.           |
-| `src/errors.ts`     | Custom error hierarchy. `FileSystemError` base + 7 subclasses.                            |
+| File                | Responsibility                                                                                       |
+| ------------------- | ---------------------------------------------------------------------------------------------------- |
+| `src/path.ts`       | Immutable `Path` value object. Parsing, normalization (`.`, `..`), `join`, `resolve`.                |
+| `src/node.ts`       | `FsNode` (abstract), `File`, `Directory`, `Symlink`. Passive data — `FileSystem` manages invariants. |
+| `src/filesystem.ts` | The `FileSystem` class. One session, one mutable cwd. All operations live here.                      |
+| `src/errors.ts`     | Custom error hierarchy. `FileSystemError` base + 7 subclasses.                                       |
 
 ### Key decisions
 
@@ -137,6 +143,17 @@ different-parent → move; existing-target-dir → move into. Cycle detection
 adds API complexity. Spec only asked for prune; return-value is the
 simpler shape.
 
+**Symlinks store paths as strings, resolved at access time.** Matches
+POSIX semantics: broken links are allowed; `mv link new-name` moves the
+link (not the target); a relative target is resolved against the
+symlink's parent directory, not the cwd. Loop detection caps resolution
+at 40 hops (Linux's `MAXSYMLINKS`) — symlink loops are a classic DOS
+vector and must be bounded. Final-segment follow behavior is operation-
+dependent: `cd`/`readFile`/`writeFile`/`ls` follow; `mv` (source) /
+`rmdir` / `readSymlink` do not. `walk` and `find` do not descend through
+symlinks (matches GNU `find` default; the `-L` opt-in is left as a
+future option).
+
 ### Strictness
 
 - `strict: true`, `noUncheckedIndexedAccess: true`, `noImplicitAny: true`
@@ -155,8 +172,8 @@ simpler shape.
 
 | Limitation                                                     | Workaround / why we did it this way                                                                                                                |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No `cp`                                                        | Would be ~30 lines but doubles the move/copy surface; chose walk over cp.                                                                          |
-| No symlink/hardlink                                            | Significant design depth required; chose breadth across paths + walk instead.                                                                      |
+| No `cp`                                                        | Would be ~30 lines but doubles the move/copy surface; spent the time on symlinks instead.                                                          |
+| No hardlinks                                                   | Distinct from symlinks (refcounted content vs. path indirection); kept symlink semantics tight rather than splitting attention.                    |
 | `String` for file content (not `Buffer`)                       | Spec says contents fit in memory; strings keep us framework-portable. Switching is a one-line change in `File`.                                    |
 | `mv` is not atomic across multiple calls                       | Single-threaded JS makes single-call atomicity implicit; multi-step ops aren't transactional. Could be added with a Transaction wrapper if needed. |
 | Reserved-name validation is policy in `FileSystem`, not `Path` | Path is library-level; FS layer enforces naming policy because different filesystems disagree. Adding new rules is a single-method change.         |
@@ -184,7 +201,7 @@ material-fs/
 │   └── filesystem.ts
 ├── tests/
 │   ├── path.test.ts        # 29 tests
-│   └── filesystem.test.ts  # 47 tests
+│   └── filesystem.test.ts  # 61 tests
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts

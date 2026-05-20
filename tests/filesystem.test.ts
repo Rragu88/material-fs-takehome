@@ -364,6 +364,127 @@ describe("FileSystem — walk subtree (extension)", () => {
   });
 });
 
+describe("FileSystem — symlinks (extension)", () => {
+  let fs: FileSystem;
+  beforeEach(() => {
+    fs = new FileSystem();
+  });
+
+  it("creates a symlink and reads its literal target", () => {
+    fs.mkdir("/target");
+    fs.symlink("/target", "/link");
+    expect(fs.readSymlink("/link")).toBe("/target");
+  });
+
+  it("follows a symlink to a file when reading content", () => {
+    fs.touch("/file");
+    fs.writeFile("/file", "hello");
+    fs.symlink("/file", "/link");
+    expect(fs.readFile("/link")).toBe("hello");
+  });
+
+  it("follows a symlink to a directory when listing", () => {
+    fs.mkdir("/dir");
+    fs.touch("/dir/a");
+    fs.touch("/dir/b");
+    fs.symlink("/dir", "/link");
+    expect(fs.ls("/link")).toEqual(["a", "b"]);
+  });
+
+  it("follows symlinks in intermediate path segments", () => {
+    fs.mkdir("/a/b/c", { recursive: true });
+    fs.touch("/a/b/c/file");
+    fs.writeFile("/a/b/c/file", "found me");
+    fs.symlink("/a/b", "/shortcut");
+    expect(fs.readFile("/shortcut/c/file")).toBe("found me");
+  });
+
+  it("supports cd through a symlink", () => {
+    fs.mkdir("/long/path/to/place", { recursive: true });
+    fs.symlink("/long/path/to/place", "/short");
+    fs.cd("/short");
+    // pwd reports the canonical resolved path, not the symlink path
+    expect(fs.pwd()).toBe("/long/path/to/place");
+  });
+
+  it("resolves relative symlink targets against the symlink's parent dir", () => {
+    fs.mkdir("/a/b", { recursive: true });
+    fs.touch("/a/sibling");
+    fs.writeFile("/a/sibling", "hi");
+    // Link inside /a/b points to "../sibling" — should resolve to /a/sibling
+    fs.symlink("../sibling", "/a/b/link");
+    expect(fs.readFile("/a/b/link")).toBe("hi");
+  });
+
+  it("permits broken symlinks (creation does not validate target)", () => {
+    fs.symlink("/does/not/exist", "/link");
+    expect(fs.readSymlink("/link")).toBe("/does/not/exist");
+    expect(() => fs.readFile("/link")).toThrow(PathNotFoundError);
+  });
+
+  it("detects symlink loops", () => {
+    fs.symlink("/b", "/a");
+    fs.symlink("/a", "/b");
+    expect(() => fs.readFile("/a")).toThrow(InvalidOperationError);
+    expect(() => fs.cd("/a")).toThrow(InvalidOperationError);
+  });
+
+  it("rmdir refuses to operate on a symlink (even one pointing to a dir)", () => {
+    fs.mkdir("/dir");
+    fs.symlink("/dir", "/link");
+    expect(() => fs.rmdir("/link")).toThrow(NotADirectoryError);
+    // The original directory remains
+    expect(fs.ls("/dir")).toEqual([]);
+  });
+
+  it("mv moves the link itself, not the target", () => {
+    fs.touch("/file");
+    fs.writeFile("/file", "data");
+    fs.symlink("/file", "/link");
+    fs.mv("/link", "/relocated");
+    // Link is gone from its old location
+    expect(() => fs.readSymlink("/link")).toThrow(PathNotFoundError);
+    // Link is at the new location, pointing to the same target
+    expect(fs.readSymlink("/relocated")).toBe("/file");
+    expect(fs.readFile("/relocated")).toBe("data");
+    // The actual file is untouched
+    expect(fs.readFile("/file")).toBe("data");
+  });
+
+  it("walk does not descend into symlinks", () => {
+    fs.mkdir("/dir");
+    fs.touch("/dir/file");
+    fs.symlink("/dir", "/link");
+    const visited: string[] = [];
+    fs.walk("/", (_node, path) => {
+      visited.push(path);
+    });
+    expect(visited).toContain("/link"); // the link itself is visited as a leaf
+    expect(visited).not.toContain("/link/file"); // but not its target's contents
+  });
+
+  it("readSymlink rejects non-symlink paths", () => {
+    fs.mkdir("/dir");
+    fs.touch("/file");
+    expect(() => fs.readSymlink("/dir")).toThrow(InvalidOperationError);
+    expect(() => fs.readSymlink("/file")).toThrow(InvalidOperationError);
+  });
+
+  it("resolves chains of symlinks up to MAX_SYMLINK_DEPTH", () => {
+    fs.touch("/end");
+    fs.writeFile("/end", "ok");
+    fs.symlink("/end", "/a");
+    fs.symlink("/a", "/b");
+    fs.symlink("/b", "/c");
+    expect(fs.readFile("/c")).toBe("ok");
+  });
+
+  it("rejects symlinks with empty or null-containing targets", () => {
+    expect(() => fs.symlink("", "/link")).toThrow(InvalidPathError);
+    expect(() => fs.symlink("a\0b", "/link")).toThrow(InvalidPathError);
+  });
+});
+
 describe("FileSystem — path edge cases", () => {
   let fs: FileSystem;
   beforeEach(() => {

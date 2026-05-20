@@ -9,11 +9,16 @@
 //   - ".." parent (a no-op at the root)
 //
 // Out of scope (deliberately not implemented):
-//   - Symlinks and hardlinks
+//   - Hardlinks (refcounted shared content)
 //   - Permissions and multi-user
 //   - Streaming I/O
 //   - Cross-directory copy (the README's copy extension is out of scope;
 //     mv is supported for both rename and cross-directory move)
+//
+// Implemented extensions:
+//   - Paths: absolute, relative, "..", recursive mkdir
+//   - Walk subtree: visitor pattern with prune-via-"skip"
+//   - Symlinks: POSIX-style, with loop detection (max 40 hops)
 //
 // Design notes:
 //   - Path resolution is centralized in `resolveNode` and
@@ -33,8 +38,15 @@ import {
   NotAFileError,
   PathNotFoundError,
 } from "./errors.js";
-import { Directory, File, FsNode } from "./node.js";
+import { Directory, File, FsNode, Symlink } from "./node.js";
 import { Path } from "./path.js";
+
+/**
+ * Maximum number of symlink hops to follow during a single path resolution.
+ * Matches Linux's MAXSYMLINKS constant. Exceeding it throws
+ * InvalidOperationError — the canonical signal of a symlink loop.
+ */
+const MAX_SYMLINK_DEPTH = 40;
 
 /**
  * Return value from a walk visitor. Returning "skip" prevents descent into
@@ -69,15 +81,37 @@ export class FileSystem {
   }
 
   /**
-   * Walk the tree from root following the path's segments. Throws
-   * PathNotFoundError if any segment doesn't exist, NotADirectoryError if
-   * an intermediate node is not a directory.
+   * Walk the tree from root following the path's segments.
+   *
+   * Symlink behavior:
+   *   - Intermediate segments are always followed.
+   *   - The final segment is followed iff `options.followFinal` is true
+   *     (the default). Operations that need the symlink itself (rmdir,
+   *     mv source, readSymlink) pass `followFinal: false`.
+   *
+   * Throws:
+   *   - PathNotFoundError if any segment doesn't exist
+   *   - NotADirectoryError if an intermediate node is not a directory
+   *   - InvalidOperationError on symlink loops (>= MAX_SYMLINK_DEPTH hops)
    */
-  private resolveNode(input: string | Path): FsNode {
-    const abs = this.absolute(input);
+  private resolveNode(input: string | Path, options: { followFinal?: boolean } = {}): FsNode {
+    const followFinal = options.followFinal ?? true;
+    return this.resolveNodeWith(this.absolute(input), followFinal, 0);
+  }
+
+  private resolveNodeWith(abs: Path, followFinal: boolean, depth: number): FsNode {
+    if (depth > MAX_SYMLINK_DEPTH) {
+      throw new InvalidOperationError(
+        `too many symlink hops (max ${MAX_SYMLINK_DEPTH})`,
+        abs.toString(),
+      );
+    }
+
     let cur: FsNode = this.root;
     const traversed: string[] = [];
-    for (const segment of abs.segments) {
+    const lastIndex = abs.segments.length - 1;
+
+    for (const [i, segment] of abs.segments.entries()) {
       if (!(cur instanceof Directory)) {
         throw new NotADirectoryError("/" + traversed.join("/"));
       }
@@ -86,9 +120,31 @@ export class FileSystem {
         throw new PathNotFoundError(abs.toString());
       }
       traversed.push(segment);
+      const isFinal = i === lastIndex;
+
+      if (child instanceof Symlink && (!isFinal || followFinal)) {
+        // Resolve the link's target. Relative targets are anchored to the
+        // symlink's parent directory, not the cwd — POSIX semantics.
+        const parent = child.parent;
+        if (parent === null) {
+          throw new InvalidOperationError("orphan symlink", abs.toString());
+        }
+        const targetPath = Path.parse(child.target).resolve(this.pathOf(parent));
+        // Any remaining unresolved segments continue past the link's target.
+        const tail = abs.segments.slice(i + 1);
+        const fullPath = tail.length === 0 ? targetPath : targetPath.join(tail.join("/"));
+        return this.resolveNodeWith(fullPath, followFinal, depth + 1);
+      }
+
       cur = child;
     }
     return cur;
+  }
+
+  /** Absolute Path of any tree node. Root → "/". */
+  private pathOf(node: FsNode): Path {
+    const segments = node.pathSegments();
+    return segments.length === 0 ? Path.root() : Path.parse("/" + segments.join("/"));
   }
 
   /**
@@ -222,7 +278,11 @@ export class FileSystem {
    *   - anything that isn't a directory
    */
   rmdir(path: string): void {
-    const target = this.resolveNode(path);
+    // followFinal: false — rmdir operates on the named node itself. If it's
+    // a symlink (even to a directory), it's "not a directory" and we throw.
+    // To remove a directory reached through a symlink, the caller resolves
+    // the path themselves.
+    const target = this.resolveNode(path, { followFinal: false });
     if (!(target instanceof Directory)) {
       throw new NotADirectoryError(path);
     }
@@ -300,7 +360,12 @@ export class FileSystem {
    *   - AlreadyExistsError if the destination name is already taken
    */
   mv(src: string, dst: string): void {
-    const srcNode = this.resolveNode(src);
+    // followFinal: false on src — `mv link new` moves the link, not the
+    // target it points to. Symlinks track paths-as-strings, so the link's
+    // target is unchanged by the move (which can make a relative-target
+    // link resolve differently from its new location — this is POSIX
+    // behavior, not a bug).
+    const srcNode = this.resolveNode(src, { followFinal: false });
     if (srcNode === this.root) {
       throw new InvalidOperationError("cannot move the root", src);
     }
@@ -357,6 +422,42 @@ export class FileSystem {
   }
 
   // ============================================================
+  // Symlinks (extension)
+  // ============================================================
+
+  /**
+   * Create a symbolic link at `linkPath` pointing to `target`.
+   *
+   * The target is stored as a literal string — broken links (pointing to
+   * nothing) are allowed and become apparent at access time. Relative
+   * targets are resolved against the link's parent directory when the
+   * link is dereferenced, not against the cwd at creation time.
+   */
+  symlink(target: string, linkPath: string): void {
+    if (target.length === 0 || target.includes("\0")) {
+      throw new InvalidPathError(
+        target,
+        "symlink target must be a non-empty path without null bytes",
+      );
+    }
+    const { parent, name } = this.resolveParentAndName(linkPath);
+    this.validateName(name);
+    this.link(parent, name, new Symlink(name, parent, target));
+  }
+
+  /**
+   * Return the literal target string of a symlink (does not follow it).
+   * Throws InvalidOperationError if the path doesn't refer to a symlink.
+   */
+  readSymlink(path: string): string {
+    const node = this.resolveNode(path, { followFinal: false });
+    if (!(node instanceof Symlink)) {
+      throw new InvalidOperationError("not a symlink", path);
+    }
+    return node.target;
+  }
+
+  // ============================================================
   // Find (base spec)
   // ============================================================
 
@@ -402,6 +503,9 @@ export class FileSystem {
       const path = segments.length === 0 ? "/" : "/" + segments.join("/");
       const action = visitor(node, path);
       if (action === "skip") return;
+      // Don't descend through symlinks — a symlink could point to an
+      // ancestor and create infinite traversal. Match GNU find's default
+      // behavior (the -L flag opts into following).
       if (node instanceof Directory) {
         for (const child of node.children.values()) {
           recurse(child, [...segments, child.name]);
